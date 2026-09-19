@@ -120,7 +120,7 @@ BEGIN
         col.ordinal_position::INT AS orden,
         COALESCE(pk.es_pk, false) AS es_pk,
         (
-            col.column_default LIKE 'nextval(%'
+            COALESCE(col.column_default LIKE 'nextval(%', false)
             OR col.is_identity = 'YES'
         ) AS es_autogenerada,
         col.column_default::TEXT AS valor_default,
