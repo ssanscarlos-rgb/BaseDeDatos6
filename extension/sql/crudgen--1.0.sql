@@ -4,8 +4,12 @@
 -- NO crear archivos .sql sueltos adicionales en esta carpeta.
 --
 -- Ver CONTRATO.md (v0.2) para la especificación de cada función.
-
-CREATE SCHEMA IF NOT EXISTS crudgen;
+--
+-- NOTA: no llevar CREATE SCHEMA aquí. El crudgen.control ya declara
+-- "schema = crudgen", así que PostgreSQL crea el esquema automáticamente
+-- antes de correr este script y lo registra como propio de la extensión.
+-- Si este script también lo crea, CREATE EXTENSION falla con:
+-- "el esquema crudgen no es un miembro de la extensión «crudgen»".
 
 -- =========================================================
 -- 1. verificar_extension()  -- CONTRATO.md sección 1
