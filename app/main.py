@@ -1,294 +1,464 @@
-"""
-Aplicación Python - Generador automático de CRUD para PostgreSQL.
+"""Generador automático de CRUD para PostgreSQL — aplicación de consola.
 
-Flujo mínimo (ver enunciado):
-Conectar -> Verificar conexión -> Verificar extensión -> Seleccionar esquema
--> Seleccionar tablas -> Analizar estructura -> Seleccionar operaciones CRUD
--> Generar procedimientos -> Seleccionar usuarios/roles -> Asignar privilegios
--> Aplicar configuración -> Mostrar resultado
-
-Este módulo NO debe contener lógica de generación de SQL específica de
-tabla alguna: eso vive en la extensión (ver ../CONTRATO.md).
+Flujo (ver enunciado):
+Conectar -> Verificar extensión -> Esquema -> Tablas -> Estructura
+-> Operaciones -> Generar -> Mostrar -> Roles/privilegios -> Aplicar
+-> Resultado -> Menú (ejecutar procedimientos, probar privilegios)
 """
 
 import psycopg
-import configparser
-from pathlib import Path
 
-def conectar(host: str, puerto: int, base_datos: str, usuario: str, contrasena: str):
-    """Establece y valida la conexión. Lanza excepción si falla."""
-    conn = psycopg.connect(
-        host=host, port=puerto, dbname=base_datos, user=usuario, password=contrasena,
-        autocommit=True
-    )
-    return conn
+import consola
+from db import (
+    CrudgenError,
+    analizar_tabla,
+    asignar_privilegio,
+    cargar_config,
+    conectar,
+    ejecutar_procedimiento,
+    generar_crud,
+    listar_esquemas,
+    listar_procedimientos_generados,
+    listar_roles,
+    listar_tablas,
+    obtener_parametros,
+    revocar_privilegio,
+    verificar_extension,
+)
 
-class CrudgenError(Exception):
-    """Error esperado de la extensión, con formato CRUDGEN:<CODIGO>: <mensaje>."""
+# Operación de la extensión -> nombre que ve el usuario (y sufijo del procedimiento)
+OPERACIONES = {
+    "INSERT": "insertar",
+    "SELECT": "consultar",
+    "UPDATE": "actualizar",
+    "DELETE": "eliminar",
+}
 
-    def __init__(self, codigo: str, mensaje: str):
-        super().__init__(mensaje)
-        self.codigo = codigo
-        self.mensaje = mensaje
 
-def _ejecutar(conn, consulta, params: tuple = (), con_columnas: bool = False):
-    """Ejecuta una consulta y devuelve sus filas (o [] si no produce resultado).
-    Con con_columnas=True devuelve (nombres_de_columnas, filas).
-    Traduce los errores CRUDGEN:... de la extensión a CrudgenError."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute(consulta, params)
-            if cur.description is None:          # CALL, GRANT, etc.: no hay filas
-                filas, columnas = [], []
-            else:
-                filas = cur.fetchall()
-                columnas = [c.name for c in cur.description]
-            return (columnas, filas) if con_columnas else filas
-    except psycopg.Error as e:
-        mensaje = e.diag.message_primary or str(e)
-        if mensaje.startswith("CRUDGEN:"):
-            _, codigo, texto = mensaje.split(":", 2)
-            raise CrudgenError(codigo, texto.strip()) from e
-        raise
+# ---------------------------------------------------------------------------
+# Pasos 1 a 6: conexión, verificación, selección y estructura
+# ---------------------------------------------------------------------------
 
-def cargar_config() -> dict:
-    """Lee app/config.ini. Ver config.ejemplo.ini para el formato."""
-    ruta = Path(__file__).parent / "config.ini"
-    config = configparser.ConfigParser()
-    if not config.read(ruta):
-        raise FileNotFoundError(
-            f"No existe {ruta}. Copia config.ejemplo.ini como config.ini y pon tus datos."
-        )
-    pg = config["postgres"]
+def pedir_datos_conexion() -> dict:
+    """Pide los cinco datos de conexión por teclado."""
+    while True:
+        puerto = consola.pedir_texto("Puerto")
+        if puerto.isdigit():
+            break
+        print("  El puerto debe ser un número.")
     return {
-        "host": pg["host"],
-        "puerto": pg.getint("puerto"),
-        "base_datos": pg["base_datos"],
-        "usuario": pg["usuario"],
-        "contrasena": pg["contrasena"],
+        "host": consola.pedir_texto("Servidor"),
+        "puerto": int(puerto),
+        "base_datos": consola.pedir_texto("Base de datos"),
+        "usuario": consola.pedir_texto("Usuario"),
+        "contrasena": consola.pedir_texto("Contraseña"),
     }
 
 
-def verificar_extension(conn) -> dict:
-    """Determina el estado de crudgen en la base conectada.
-    estado: INSTALADA, NO_INSTALADA, SIN_ARCHIVOS, SIN_PERMISOS o ERROR."""
-    try:
-        # 1. ¿Está instalada en esta base?
-        filas = _ejecutar(
-            conn, "SELECT extversion FROM pg_extension WHERE extname = 'crudgen';"
+def paso_conectar(usar_config: bool = True):
+    """Paso 1: obtener los datos de conexión y conectar.
+    Reintenta hasta conectar; devuelve None solo si el usuario decide salir."""
+    consola.titulo("1. Conexión a PostgreSQL")
+
+    datos = None
+    if usar_config:
+        try:
+            datos = cargar_config()
+            print(f"  Configuración encontrada: {datos['usuario']}@{datos['host']}:"
+                  f"{datos['puerto']}/{datos['base_datos']}")
+            if not consola.pedir_si_no("¿Usar esta configuración?"):
+                datos = None
+        except FileNotFoundError:
+            print("  No hay config.ini; ingrese los datos manualmente.")
+
+    while True:
+        if datos is None:
+            datos = pedir_datos_conexion()
+        try:
+            conn = conectar(**datos)
+            print("  Conexión exitosa.")
+            return conn
+        except psycopg.OperationalError as e:
+            print(f"\n  No se pudo conectar: {e}")
+            if not consola.pedir_si_no("¿Intentar con otros datos?"):
+                return None
+            datos = None
+
+
+def paso_verificar(conn) -> bool:
+    """Paso 2: comprobar que la extensión está instalada y disponible."""
+    consola.titulo("2. Verificación de la extensión")
+    estado = verificar_extension(conn)
+    print(f"  {estado['estado']}: {estado['mensaje']}")
+    return estado["estado"] == "INSTALADA"
+
+
+def conectar_y_verificar():
+    """Pasos 1 y 2 juntos: no avanza hasta tener una conexión con la
+    extensión lista. Devuelve None solo si el usuario decide salir."""
+    conn = paso_conectar()
+    while conn is not None and not paso_verificar(conn):
+        opcion = consola.elegir_uno(
+            ["Verificar de nuevo", "Conectar a otra base", "Salir"], "¿Qué desea hacer?"
         )
-        if not filas:
-            # 2. No está instalada. ¿Al menos están los archivos en el servidor?
-            disponible = _ejecutar(
-                conn,
-                "SELECT 1 FROM pg_available_extensions WHERE name = 'crudgen';",
+        if opcion == "Conectar a otra base":
+            conn.close()
+            conn = paso_conectar(usar_config=False)
+        elif opcion == "Salir":
+            conn.close()
+            return None
+    return conn
+
+
+def paso_esquema(conn) -> str | None:
+    """Paso 3: elegir un esquema. None si la base no tiene esquemas."""
+    consola.titulo("3. Selección de esquema")
+    esquemas = listar_esquemas(conn)
+    if not esquemas:
+        print("  No hay esquemas disponibles.")
+        return None
+    return consola.elegir_uno(esquemas, "Esquema")
+
+
+def paso_tablas(conn, esquema: str) -> list[str]:
+    """Paso 4: elegir una, varias o todas las tablas del esquema.
+    Devuelve [] si el esquema no tiene tablas."""
+    consola.titulo(f"4. Selección de tablas en '{esquema}'")
+    tablas = listar_tablas(conn, esquema)
+    if not tablas:
+        print("  Este esquema no tiene tablas.")
+        return []
+
+    etiquetas = {}
+    for t in tablas:
+        etiqueta = t["nombre_tabla"]
+        if not t["tiene_pk"]:
+            etiqueta += "  (sin PK: no admite UPDATE ni DELETE)"
+        etiquetas[etiqueta] = t["nombre_tabla"]
+
+    elegidas = consola.elegir_varios(list(etiquetas), "Tablas")
+    return [etiquetas[e] for e in elegidas]
+
+
+def paso_estructura(conn, esquema: str, tablas: list[str]) -> dict:
+    """Paso 5: mostrar la estructura de cada tabla.
+    Devuelve, por tabla, si tiene PK y si tiene columnas actualizables."""
+    consola.titulo("5. Estructura de las tablas")
+    info = {}
+    for tabla in tablas:
+        columnas = analizar_tabla(conn, esquema, tabla)
+        print(f"\n  Tabla {esquema}.{tabla}")
+        consola.mostrar_tabla(
+            ["columna", "tipo", "PK", "autogenerada", "acepta NULL", "default"],
+            [
+                (
+                    c["columna"],
+                    c["tipo"],
+                    "sí" if c["es_pk"] else "",
+                    "sí" if c["es_autogenerada"] else "",
+                    "sí" if c["es_nullable"] else "",
+                    c["valor_default"] or "",
+                )
+                for c in columnas
+            ],
+        )
+        info[tabla] = {
+            "tiene_pk": any(c["es_pk"] for c in columnas),
+            "tiene_actualizables": any(
+                not c["es_pk"] and not c["es_autogenerada"] for c in columnas
+            ),
+        }
+    return info
+
+
+def paso_operaciones(info: dict) -> dict:
+    """Paso 6: elegir operaciones y ajustarlas a lo que admite cada tabla.
+    Devuelve {tabla: [operaciones]}."""
+    consola.titulo("6. Operaciones CRUD")
+    elegidas = consola.elegir_varios(list(OPERACIONES), "Operaciones")
+
+    plan = {}
+    for tabla, datos in info.items():
+        ops = list(elegidas)
+        if not datos["tiene_pk"]:
+            quitadas = [op for op in ops if op in ("UPDATE", "DELETE")]
+            ops = [op for op in ops if op not in ("UPDATE", "DELETE")]
+            if quitadas:
+                print(f"  Aviso: {tabla} no tiene PK; se omite {', '.join(quitadas)}.")
+        elif not datos["tiene_actualizables"] and "UPDATE" in ops:
+            ops.remove("UPDATE")
+            print(f"  Aviso: {tabla} no tiene columnas actualizables; se omite UPDATE.")
+        if ops:
+            plan[tabla] = ops
+        else:
+            print(f"  Aviso: no queda ninguna operación para {tabla}; se omite la tabla.")
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# Pasos 7 a 11: generación, privilegios y resultado
+# ---------------------------------------------------------------------------
+
+def paso_generar(conn, esquema: str, plan: dict) -> list[dict]:
+    """Paso 7: generar los procedimientos de cada tabla.
+    Si una tabla falla, se informa y se sigue con las demás."""
+    consola.titulo("7. Generación de procedimientos")
+    generados = []
+    for tabla, ops in plan.items():
+        try:
+            for r in generar_crud(conn, esquema, tabla, ops):
+                generados.append({
+                    "tabla": tabla,
+                    "operacion": r["operacion"],
+                    "procedimiento": r["nombre_procedimiento"],
+                    "ya_existia": r["ya_existia"],
+                })
+        except CrudgenError as e:
+            print(f"  Error en {tabla}: {e.mensaje}")
+
+    consola.mostrar_tabla(
+        ["tabla", "operación", "procedimiento", "estado"],
+        [
+            (g["tabla"], g["operacion"], g["procedimiento"],
+             "reemplazado" if g["ya_existia"] else "creado")
+            for g in generados
+        ],
+    )
+    return generados
+
+
+def paso_mostrar(conn, esquema: str, generados: list[dict]) -> None:
+    """Paso 8: listar los procedimientos creados y permitir ver su código."""
+    consola.titulo("8. Procedimientos creados")
+
+    definiciones = {}
+    for tabla in dict.fromkeys(g["tabla"] for g in generados):
+        for p in listar_procedimientos_generados(conn, esquema, tabla):
+            definiciones[p["nombre_procedimiento"]] = p
+
+    nombres = [g["procedimiento"] for g in generados if g["procedimiento"] in definiciones]
+    consola.mostrar_tabla(
+        ["procedimiento", "tipo"],
+        [(n, definiciones[n]["tipo"]) for n in nombres],
+    )
+    while consola.pedir_si_no("¿Ver el código de algún procedimiento?"):
+        nombre = consola.elegir_uno(nombres, "Procedimiento")
+        print()
+        print(definiciones[nombre]["definicion"])
+
+
+def paso_privilegios(conn, generados: list[dict]) -> dict:
+    """Paso 9: elegir roles y qué operaciones puede ejecutar cada uno.
+    Devuelve la matriz {rol: [operaciones permitidas]}."""
+    consola.titulo("9. Roles y privilegios")
+    roles = [r["nombre_rol"] for r in listar_roles(conn)]
+    elegidos = consola.elegir_varios(roles, "Roles a configurar")
+
+    # Solo se ofrecen las operaciones que realmente se generaron
+    disponibles = [
+        nombre for op, nombre in OPERACIONES.items()
+        if any(g["operacion"] == op for g in generados)
+    ]
+    NINGUNA = "(ninguna)"
+
+    matriz = {}
+    for rol in elegidos:
+        print(f"\n  ¿Qué operaciones puede ejecutar '{rol}'?")
+        permitidas = consola.elegir_varios(disponibles + [NINGUNA], "Operaciones")
+        matriz[rol] = [] if NINGUNA in permitidas else permitidas
+
+    print("\n  Matriz de privilegios:")
+    consola.mostrar_tabla(
+        ["rol"] + disponibles,
+        [
+            tuple([rol] + ["✓" if op in permitidas else "✗" for op in disponibles])
+            for rol, permitidas in matriz.items()
+        ],
+    )
+    return matriz
+
+
+def paso_aplicar(conn, esquema: str, generados: list[dict], matriz: dict) -> list[tuple]:
+    """Paso 10: traducir la matriz a GRANT (✓) y REVOKE (✗)."""
+    consola.titulo("10. Aplicar configuración")
+    if not consola.pedir_si_no("¿Aplicar esta matriz de privilegios?"):
+        print("  No se aplicaron cambios.")
+        return []
+
+    resultados = []
+    for rol, permitidas in matriz.items():
+        for g in generados:
+            permitido = OPERACIONES[g["operacion"]] in permitidas
+            try:
+                if permitido:
+                    asignar_privilegio(conn, esquema, g["procedimiento"], rol)
+                else:
+                    revocar_privilegio(conn, esquema, g["procedimiento"], rol)
+                estado = "ok"
+            except CrudgenError as e:
+                estado = f"error: {e.mensaje}"
+            resultados.append(
+                (rol, g["procedimiento"], "GRANT" if permitido else "REVOKE", estado)
             )
-            if disponible:
-                return {
-                    "estado": "NO_INSTALADA",
-                    "mensaje": "Los archivos están en el servidor, pero falta "
-                               "CREATE EXTENSION crudgen en esta base.",
-                }
-            return {
-                "estado": "SIN_ARCHIVOS",
-                "mensaje": "La extensión no está instalada ni sus archivos "
-                           "están en el servidor.",
-            }
 
-        version = filas[0][0]
+    consola.mostrar_tabla(["rol", "procedimiento", "acción", "resultado"], resultados)
+    return resultados
 
-        # 3. Está instalada. ¿El usuario puede usarla?
-        fila = _ejecutar(conn, "SELECT * FROM crudgen.verificar_extension();")[0]
-        if not fila[1]:  # disponible_para_usuario
-            return {
-                "estado": "SIN_PERMISOS",
-                "mensaje": "La extensión está instalada, pero el usuario "
-                           "conectado no tiene permisos para usarla.",
-            }
-        return {
-            "estado": "INSTALADA",
-            "mensaje": f"Extensión crudgen {version} lista.",
-        }
 
-    except psycopg.errors.InsufficientPrivilege:
-        return {
-            "estado": "SIN_PERMISOS",
-            "mensaje": "La extensión está instalada, pero el usuario "
-                       "conectado no tiene permisos para usarla.",
-        }
+def paso_resultado(generados: list[dict], aplicados: list[tuple]) -> None:
+    """Paso 11: resumen de lo realizado."""
+    consola.titulo("11. Resultado")
+    creados = sum(1 for g in generados if not g["ya_existia"])
+    reemplazados = len(generados) - creados
+    errores = sum(1 for a in aplicados if a[3] != "ok")
+    print(f"  Procedimientos creados:      {creados}")
+    print(f"  Procedimientos reemplazados: {reemplazados}")
+    print(f"  Privilegios aplicados:       {len(aplicados) - errores}")
+    print(f"  Errores de privilegios:      {errores}")
+
+
+# ---------------------------------------------------------------------------
+# Menú final: ejecutar procedimientos y comprobar privilegios
+# ---------------------------------------------------------------------------
+
+def accion_ejecutar(conn, esquema: str, generados: list[dict], como_rol: str | None = None) -> None:
+    """Pide los parámetros de un procedimiento y lo ejecuta."""
+    procedimiento = consola.elegir_uno([g["procedimiento"] for g in generados], "Procedimiento")
+
+    parametros = obtener_parametros(conn, esquema, procedimiento)
+    valores = {}
+    if parametros:
+        print("  (Escriba NULL para enviar un valor nulo.)")
+    for p in parametros:
+        valor = consola.pedir_texto(f"  {p['nombre']} ({p['tipo']})", opcional=p["opcional"])
+        if valor is None:
+            continue  # parámetro opcional omitido
+        valores[p["nombre"]] = None if valor.upper() == "NULL" else valor
+
+    quien = f" como '{como_rol}'" if como_rol else ""
+    try:
+        columnas, filas = ejecutar_procedimiento(
+            conn, esquema, procedimiento, valores, como_rol=como_rol
+        )
+    except CrudgenError as e:
+        print(f"\n  No se pudo ejecutar{quien}: {e.mensaje}")
+        return
     except psycopg.Error as e:
-        return {"estado": "ERROR", "mensaje": f"Error al consultar la extensión: {e}"}
+        print(f"\n  PostgreSQL rechazó la operación{quien}: "
+              f"{e.diag.message_primary or e}")
+        return
+
+    print()
+    if columnas:
+        consola.mostrar_tabla(columnas, filas)
+    else:
+        print(f"  {procedimiento} se ejecutó correctamente{quien}.")
 
 
-def listar_esquemas(conn) -> list[str]:
-    """Ver CONTRATO.md sección 2."""
-    filas = _ejecutar(conn, "SELECT nombre_esquema FROM crudgen.listar_esquemas();")
-    return [r[0] for r in filas]
+def menu(conn, esquema: str, generados: list[dict]) -> str:
+    """Menú final para operar con los procedimientos generados.
+    Devuelve 'tablas', 'esquema' o 'salir' según lo que elija el usuario."""
+    EJECUTAR = "Ejecutar un procedimiento"
+    COMO_ROL = "Ejecutar un procedimiento como otro rol (probar privilegios)"
+    VER = "Ver procedimientos creados"
+    PRIVILEGIOS = "Reconfigurar privilegios"
+    OTRAS = "Generar para otras tablas de este esquema"
+    CAMBIAR = "Cambiar de esquema"
+    SALIR = "Salir"
+
+    while True:
+        consola.titulo("Menú")
+        opcion = consola.elegir_uno(
+            [EJECUTAR, COMO_ROL, VER, PRIVILEGIOS, OTRAS, CAMBIAR, SALIR]
+        )
+        if opcion == EJECUTAR:
+            accion_ejecutar(conn, esquema, generados)
+        elif opcion == COMO_ROL:
+            roles = [r["nombre_rol"] for r in listar_roles(conn)]
+            rol = consola.elegir_uno(roles, "Rol")
+            accion_ejecutar(conn, esquema, generados, como_rol=rol)
+        elif opcion == VER:
+            paso_mostrar(conn, esquema, generados)
+        elif opcion == PRIVILEGIOS:
+            matriz = paso_privilegios(conn, generados)
+            paso_aplicar(conn, esquema, generados, matriz)
+        elif opcion == OTRAS:
+            return "tablas"
+        elif opcion == CAMBIAR:
+            return "esquema"
+        else:
+            return "salir"
 
 
-# TODO: listar_tablas, analizar_tabla, generar_crud, asignar_privilegio,
-# revocar_privilegio -- wrappers análogos a los de arriba, siguiendo
-# CONTRATO.md. Responsable: C.
-
-def listar_tablas(conn, esquema: str) -> list[dict]:
-    """Ver CONTRATO.md sección 3."""
-    filas = _ejecutar(
-        conn,
-        "SELECT nombre_tabla, tiene_pk FROM crudgen.listar_tablas(%s);",
-        (esquema,),
+def que_sigue(motivo: str) -> str:
+    """Cuando un paso no puede continuar: explicar y dejar elegir cómo seguir.
+    Devuelve 'tablas', 'esquema' o 'salir'."""
+    print(f"\n  {motivo}")
+    opcion = consola.elegir_uno(
+        ["Elegir otras tablas u operaciones", "Cambiar de esquema", "Salir"],
+        "¿Qué desea hacer?",
     )
-    return [{"nombre_tabla": r[0], "tiene_pk": r[1]} for r in filas]
-    
-
-def analizar_tabla(conn, esquema: str, tabla: str) -> list[dict]:
-    """Ver CONTRATO.md sección 4."""
-    filas = _ejecutar(
-        conn,
-        """
-        SELECT columna, tipo, orden, es_pk, es_autogenerada,
-               valor_default, es_nullable
-        FROM crudgen.analizar_tabla(%s, %s);
-        """,
-        (esquema, tabla),
-    )
-    return [
-        {
-            "columna": r[0],
-            "tipo": r[1],
-            "orden": r[2],
-            "es_pk": r[3],
-            "es_autogenerada": r[4],
-            "valor_default": r[5],
-            "es_nullable": r[6],
-        }
-        for r in filas
-    ]
-
-def generar_crud(conn, esquema: str, tabla: str, operaciones: list[str]) -> list[dict]:
-    """Ver CONTRATO.md sección 5."""
-    filas = _ejecutar(
-        conn,
-        """
-        SELECT operacion, nombre_procedimiento, ya_existia
-        FROM crudgen.generar_crud(%s, %s, %s);
-        """,
-        (esquema, tabla, operaciones),
-    )
-    return [
-        {"operacion": r[0], "nombre_procedimiento": r[1], "ya_existia": r[2]}
-        for r in filas
-    ]
+    return {"Elegir otras tablas u operaciones": "tablas",
+            "Cambiar de esquema": "esquema",
+            "Salir": "salir"}[opcion]
 
 
-def asignar_privilegio(conn, esquema: str, procedimiento: str, rol: str) -> bool:
-    """Ver CONTRATO.md sección 6."""
-    filas = _ejecutar(
-        conn,
-        "SELECT crudgen.asignar_privilegio(%s, %s, %s);",
-        (esquema, procedimiento, rol),
-    )
-    return filas[0][0]
+# ---------------------------------------------------------------------------
 
+def main() -> None:
+    conn = conectar_y_verificar()
+    if conn is None:
+        print("\n  Hasta luego.")
+        return
 
-def revocar_privilegio(conn, esquema: str, procedimiento: str, rol: str) -> bool:
-    """Ver CONTRATO.md sección 7."""
-    filas = _ejecutar(
-        conn,
-        "SELECT crudgen.revocar_privilegio(%s, %s, %s);",
-        (esquema, procedimiento, rol),
-    )
-    return filas[0][0]
+    try:
+        esquema = None
+        while True:
+            # Paso 3: solo se pide esquema al inicio o si el usuario quiere cambiarlo
+            if esquema is None:
+                esquema = paso_esquema(conn)
+                if esquema is None:
+                    if consola.pedir_si_no("¿Volver a consultar los esquemas?"):
+                        continue
+                    break
 
-def obtener_parametros(conn, esquema: str, procedimiento: str) -> list[dict]:
-    """Parámetros de entrada de un procedimiento generado, en orden."""
-    filas = _ejecutar(
-        conn,
-        """
-        SELECT p.parameter_name, p.udt_name, p.parameter_default IS NOT NULL
-        FROM information_schema.parameters p
-        JOIN information_schema.routines r
-          ON r.specific_schema = p.specific_schema
-         AND r.specific_name   = p.specific_name
-        WHERE r.routine_schema = %s
-          AND r.routine_name   = %s
-          AND p.parameter_mode = 'IN'
-        ORDER BY p.ordinal_position;
-        """,
-        (esquema, procedimiento),
-    )
-    return [
-        {"nombre": r[0], "tipo": r[1], "opcional": r[2]}
-        for r in filas
-    ]
+            # Paso 4
+            tablas = paso_tablas(conn, esquema)
+            if not tablas:
+                esquema = None  # esquema vacío: volver a elegir esquema
+                continue
 
-def es_funcion(conn, esquema: str, procedimiento: str) -> bool:
-    """True si es FUNCTION (se llama con SELECT), False si es PROCEDURE (con CALL)."""
-    filas = _ejecutar(
-        conn,
-        """
-        SELECT routine_type FROM information_schema.routines
-        WHERE routine_schema = %s AND routine_name = %s;
-        """,
-        (esquema, procedimiento),
-    )
-    if not filas:
-        raise CrudgenError("PROC_NO_EXISTE", f"No existe {esquema}.{procedimiento}")
-    return filas[0][0] == "FUNCTION"
+            # Pasos 5 y 6
+            info = paso_estructura(conn, esquema, tablas)
+            plan = paso_operaciones(info)
+            if not plan:
+                siguiente = que_sigue("Con esa selección no hay nada que generar.")
+            else:
+                # Paso 7
+                generados = paso_generar(conn, esquema, plan)
+                if not generados:
+                    siguiente = que_sigue("No se generó ningún procedimiento.")
+                else:
+                    # Pasos 8 a 11 y menú
+                    paso_mostrar(conn, esquema, generados)
+                    matriz = paso_privilegios(conn, generados)
+                    aplicados = paso_aplicar(conn, esquema, generados, matriz)
+                    paso_resultado(generados, aplicados)
+                    siguiente = menu(conn, esquema, generados)
 
+            if siguiente == "salir":
+                break
+            if siguiente == "esquema":
+                esquema = None
+            # 'tablas': se conserva el esquema y el ciclo vuelve al paso 4
+    finally:
+        conn.close()
 
-def ejecutar_procedimiento(conn, esquema: str, procedimiento: str, valores: dict):
-    """Ejecuta un procedimiento generado pasando los parámetros por nombre.
-    valores: {"p_nombre": "Ana", ...}. Los parámetros opcionales se omiten.
-    Devuelve (columnas, filas); en un CALL, ambas vienen vacías."""
-    argumentos = sql.SQL(", ").join(
-        sql.SQL("{} => {}").format(sql.Identifier(nombre), sql.Placeholder())
-        for nombre in valores
-    )
-    plantilla = "SELECT * FROM {}.{}({});" if es_funcion(conn, esquema, procedimiento) \
-        else "CALL {}.{}({});"
-    consulta = sql.SQL(plantilla).format(
-        sql.Identifier(esquema), sql.Identifier(procedimiento), argumentos
-    )
-    return _ejecutar(conn, consulta, tuple(valores.values()), con_columnas=True)
+    print("\n  Hasta luego.")
 
-
-# TODO: capa de UI (CLI o gráfica) que orqueste el flujo completo.
 
 if __name__ == "__main__":
-    cfg = cargar_config()
-    conn = conectar(**cfg)
-
-    
-    estado = verificar_extension(conn)
-    print(estado["estado"], "-", estado["mensaje"])
-    if estado["estado"] != "INSTALADA":
-        conn.close()
-        raise SystemExit(1)
-
-    print(listar_esquemas(conn))
-    for col in analizar_tabla(conn, "ventas", "clientes"):
-        print(col)
-    for t in listar_tablas(conn, "ventas"):
-        print(t)
-    for r in generar_crud(conn, "ventas", "clientes", ["INSERT", "SELECT"]):
-        print(r)
-
-    print(asignar_privilegio(conn, "ventas", "clientes_insertar", "vendedor"))
-    print(asignar_privilegio(conn, "ventas", "clientes_consultar", "vendedor"))
-    print(revocar_privilegio(conn, "ventas", "clientes_insertar", "vendedor"))
-
     try:
-        listar_tablas(conn, "no_existe")
-    except CrudgenError as e:
-        print(f"No se pudo: {e.mensaje} (código: {e.codigo})")
-
-    for r in generar_crud(conn, "ventas", "clientes", ["INSERT", "SELECT", "UPDATE", "DELETE"]):
-        print(r)
-    for r in generar_crud(conn, "ventas", "matricula", ["INSERT", "SELECT", "DELETE"]):
-        print(r)
-
-    for proc in ["clientes_insertar", "clientes_actualizar", "clientes_consultar"]:
-        print(proc, obtener_parametros(conn, "ventas", proc))  
-
-    
-    conn.close()
+        main()
+    except KeyboardInterrupt:
+        print("\n\nProceso cancelado por el usuario.")
