@@ -122,6 +122,7 @@ BEGIN
         (
             COALESCE(col.column_default LIKE 'nextval(%', false)
             OR col.is_identity = 'YES'
+            OR col.is_generated = 'ALWAYS'
         ) AS es_autogenerada,
         col.column_default::TEXT AS valor_default,
         (col.is_nullable = 'YES') AS es_nullable
@@ -205,7 +206,10 @@ BEGIN
             v_insert_param_defs := array_append(v_insert_param_defs, format('p_%s %s', v_col.columna, v_col.tipo));
         END IF;
 
-        IF NOT v_col.es_pk THEN
+        -- [FIX] antes solo se excluía por ser PK; una columna GENERATED
+        -- ALWAYS AS (...) STORED tampoco se puede tocar en UPDATE (Postgres
+        -- la rechaza igual que en INSERT), así que también se excluye aquí.
+        IF NOT v_col.es_pk AND NOT v_col.es_autogenerada THEN
             v_update_param_defs := array_append(v_update_param_defs, format('p_%s %s DEFAULT NULL', v_col.columna, v_col.tipo));
             v_set_clauses       := array_append(v_set_clauses, format('%I = COALESCE(p_%s, %I)', v_col.columna, v_col.columna, v_col.columna));
         END IF;
@@ -447,5 +451,61 @@ BEGIN
 
     EXECUTE format('REVOKE EXECUTE ON %s FROM %I', v_objeto_sql, p_rol);
     RETURN TRUE;
+END;
+$$;
+
+
+-- =====================================================================
+-- 8. listar_roles()  -- CONTRATO.md sección 8 (nueva)
+-- Responsable: Jeanca (A)
+-- Necesaria para el paso "seleccionar usuarios o roles" del flujo.
+-- =====================================================================
+CREATE OR REPLACE FUNCTION crudgen.listar_roles()
+RETURNS TABLE(nombre_rol TEXT, puede_iniciar_sesion BOOLEAN)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT r.rolname::TEXT, r.rolcanlogin
+    FROM pg_roles r
+    WHERE r.rolname NOT LIKE 'pg\_%'  -- excluye roles internos de Postgres
+    ORDER BY r.rolname;
+END;
+$$;
+
+
+-- =====================================================================
+-- 9. listar_procedimientos_generados(p_esquema TEXT, p_tabla TEXT DEFAULT NULL)
+--    CONTRATO.md sección 9 (nueva)
+-- Responsable: Jeanca (A)
+-- Muestra qué procedimientos/funciones ya se generaron en un esquema,
+-- opcionalmente filtrado por tabla (según convención de nombres
+-- <tabla>_insertar/_consultar/_actualizar/_eliminar), con su código SQL.
+-- =====================================================================
+CREATE OR REPLACE FUNCTION crudgen.listar_procedimientos_generados(p_esquema TEXT, p_tabla TEXT DEFAULT NULL)
+RETURNS TABLE(nombre_procedimiento TEXT, tipo TEXT, definicion TEXT)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = p_esquema) THEN
+        RAISE EXCEPTION 'CRUDGEN:ESQUEMA_NO_EXISTE: el esquema % no existe', p_esquema;
+    END IF;
+
+    RETURN QUERY
+    SELECT
+        p.proname::TEXT,
+        (CASE WHEN p.prokind = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END)::TEXT,
+        pg_get_functiondef(p.oid)
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = p_esquema
+      AND (
+          p_tabla IS NULL
+          OR p.proname LIKE p_tabla || '\_insertar'
+          OR p.proname LIKE p_tabla || '\_consultar'
+          OR p.proname LIKE p_tabla || '\_actualizar'
+          OR p.proname LIKE p_tabla || '\_eliminar'
+      )
+    ORDER BY p.proname;
 END;
 $$;
