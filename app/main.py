@@ -51,7 +51,7 @@ def pedir_datos_conexion() -> dict:
         "puerto": int(puerto),
         "base_datos": consola.pedir_texto("Base de datos"),
         "usuario": consola.pedir_texto("Usuario"),
-        "contrasena": consola.pedir_texto("Contraseña"),
+        "contrasena": consola.pedir_secreto("Contraseña"),
     }
 
 
@@ -215,6 +215,11 @@ def paso_generar(conn, esquema: str, plan: dict) -> list[dict]:
                 })
         except CrudgenError as e:
             print(f"  Error en {tabla}: {e.mensaje}")
+        except psycopg.OperationalError:
+            raise                      # conexión caída: lo maneja main()
+        except psycopg.Error as e:
+            print(f"  PostgreSQL rechazó la generación de {tabla}: "
+                  f"{e.diag.message_primary or e}")
 
     consola.mostrar_tabla(
         ["tabla", "operación", "procedimiento", "estado"],
@@ -297,6 +302,10 @@ def paso_aplicar(conn, esquema: str, generados: list[dict], matriz: dict) -> lis
                 estado = "ok"
             except CrudgenError as e:
                 estado = f"error: {e.mensaje}"
+            except psycopg.OperationalError:
+                raise                  # conexión caída: lo maneja main()
+            except psycopg.Error as e:
+                estado = f"error: {e.diag.message_primary or e}"
             resultados.append(
                 (rol, g["procedimiento"], "GRANT" if permitido else "REVOKE", estado)
             )
@@ -328,7 +337,9 @@ def accion_ejecutar(conn, esquema: str, generados: list[dict], como_rol: str | N
     parametros = obtener_parametros(conn, esquema, procedimiento)
     valores = {}
     if parametros:
-        print("  (Escriba NULL para enviar un valor nulo.)")
+        print("  (Enter omite un parámetro opcional: se usa su valor por defecto.)")
+        print("  (En un procedimiento de actualizar, un parámetro omitido o NULL "
+              "significa 'no modificar'.)")
     for p in parametros:
         valor = consola.pedir_texto(f"  {p['nombre']} ({p['tipo']})", opcional=p["opcional"])
         if valor is None:
@@ -371,23 +382,30 @@ def menu(conn, esquema: str, generados: list[dict]) -> str:
         opcion = consola.elegir_uno(
             [EJECUTAR, COMO_ROL, VER, PRIVILEGIOS, OTRAS, CAMBIAR, SALIR]
         )
-        if opcion == EJECUTAR:
-            accion_ejecutar(conn, esquema, generados)
-        elif opcion == COMO_ROL:
-            roles = [r["nombre_rol"] for r in listar_roles(conn)]
-            rol = consola.elegir_uno(roles, "Rol")
-            accion_ejecutar(conn, esquema, generados, como_rol=rol)
-        elif opcion == VER:
-            paso_mostrar(conn, esquema, generados)
-        elif opcion == PRIVILEGIOS:
-            matriz = paso_privilegios(conn, generados)
-            paso_aplicar(conn, esquema, generados, matriz)
-        elif opcion == OTRAS:
-            return "tablas"
-        elif opcion == CAMBIAR:
-            return "esquema"
-        else:
-            return "salir"
+        try:
+            if opcion == EJECUTAR:
+                accion_ejecutar(conn, esquema, generados)
+            elif opcion == COMO_ROL:
+                roles = [r["nombre_rol"] for r in listar_roles(conn)]
+                rol = consola.elegir_uno(roles, "Rol")
+                accion_ejecutar(conn, esquema, generados, como_rol=rol)
+            elif opcion == VER:
+                paso_mostrar(conn, esquema, generados)
+            elif opcion == PRIVILEGIOS:
+                matriz = paso_privilegios(conn, generados)
+                paso_aplicar(conn, esquema, generados, matriz)
+            elif opcion == OTRAS:
+                return "tablas"
+            elif opcion == CAMBIAR:
+                return "esquema"
+            else:
+                return "salir"
+        except CrudgenError as e:
+            print(f"\n  Error: {e.mensaje}")
+        except psycopg.OperationalError:
+            raise                      # conexión caída: lo maneja main()
+        except psycopg.Error as e:
+            print(f"\n  PostgreSQL rechazó la operación: {e.diag.message_primary or e}")
 
 
 def que_sigue(motivo: str) -> str:
@@ -414,37 +432,48 @@ def main() -> None:
     try:
         esquema = None
         while True:
-            # Paso 3: solo se pide esquema al inicio o si el usuario quiere cambiarlo
-            if esquema is None:
-                esquema = paso_esquema(conn)
+            try:
+                # Paso 3: solo se pide esquema al inicio o si el usuario quiere cambiarlo
                 if esquema is None:
-                    if consola.pedir_si_no("¿Volver a consultar los esquemas?"):
-                        continue
-                    break
+                    esquema = paso_esquema(conn)
+                    if esquema is None:
+                        if consola.pedir_si_no("¿Volver a consultar los esquemas?"):
+                            continue
+                        break
 
-            # Paso 4
-            tablas = paso_tablas(conn, esquema)
-            if not tablas:
-                esquema = None  # esquema vacío: volver a elegir esquema
-                continue
+                # Paso 4
+                tablas = paso_tablas(conn, esquema)
+                if not tablas:
+                    esquema = None  # esquema vacío: volver a elegir esquema
+                    continue
 
-            # Pasos 5 y 6
-            info = paso_estructura(conn, esquema, tablas)
-            plan = paso_operaciones(info)
-            if not plan:
-                siguiente = que_sigue("Con esa selección no hay nada que generar.")
-            else:
-                # Paso 7
-                generados = paso_generar(conn, esquema, plan)
-                if not generados:
-                    siguiente = que_sigue("No se generó ningún procedimiento.")
+                # Pasos 5 y 6
+                info = paso_estructura(conn, esquema, tablas)
+                plan = paso_operaciones(info)
+                if not plan:
+                    siguiente = que_sigue("Con esa selección no hay nada que generar.")
                 else:
-                    # Pasos 8 a 11 y menú
-                    paso_mostrar(conn, esquema, generados)
-                    matriz = paso_privilegios(conn, generados)
-                    aplicados = paso_aplicar(conn, esquema, generados, matriz)
-                    paso_resultado(generados, aplicados)
-                    siguiente = menu(conn, esquema, generados)
+                    # Paso 7
+                    generados = paso_generar(conn, esquema, plan)
+                    if not generados:
+                        siguiente = que_sigue("No se generó ningún procedimiento.")
+                    else:
+                        # Pasos 8 a 11 y menú
+                        paso_mostrar(conn, esquema, generados)
+                        matriz = paso_privilegios(conn, generados)
+                        aplicados = paso_aplicar(conn, esquema, generados, matriz)
+                        paso_resultado(generados, aplicados)
+                        siguiente = menu(conn, esquema, generados)
+
+            except CrudgenError as e:
+                siguiente = que_sigue(f"Error: {e.mensaje}")
+            except psycopg.Error as e:
+                if conn.closed or isinstance(e, psycopg.OperationalError):
+                    print(f"\n  Se perdió la conexión con PostgreSQL: {e}")
+                    break
+                siguiente = que_sigue(
+                    f"PostgreSQL rechazó la operación: {e.diag.message_primary or e}"
+                )
 
             if siguiente == "salir":
                 break
@@ -452,7 +481,8 @@ def main() -> None:
                 esquema = None
             # 'tablas': se conserva el esquema y el ciclo vuelve al paso 4
     finally:
-        conn.close()
+        if not conn.closed:
+            conn.close()
 
     print("\n  Hasta luego.")
 
@@ -460,5 +490,5 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         print("\n\nProceso cancelado por el usuario.")

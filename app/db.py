@@ -1,28 +1,26 @@
-"""
-Aplicación Python - Generador automático de CRUD para PostgreSQL.
+"""Capa de acceso a PostgreSQL de la aplicación (wrappers de la extensión crudgen).
 
-Flujo mínimo (ver enunciado):
-Conectar -> Verificar conexión -> Verificar extensión -> Seleccionar esquema
--> Seleccionar tablas -> Analizar estructura -> Seleccionar operaciones CRUD
--> Generar procedimientos -> Seleccionar usuarios/roles -> Asignar privilegios
--> Aplicar configuración -> Mostrar resultado
-
-Este módulo NO debe contener lógica de generación de SQL específica de
-tabla alguna: eso vive en la extensión (ver ../CONTRATO.md).
+Este módulo NO contiene lógica de generación de SQL específica de ninguna
+tabla: eso vive en la extensión (ver docs/CONTRATO.md). Aquí solo se llaman
+las funciones de la extensión con parámetros enlazados, y los identificadores
+que hay que armar dinámicamente (nombre de un procedimiento, un rol) se
+construyen con psycopg.sql.Identifier, nunca concatenando texto.
 """
 
-import psycopg
 import configparser
 from pathlib import Path
+
+import psycopg
 from psycopg import sql
 
+
 def conectar(host: str, puerto: int, base_datos: str, usuario: str, contrasena: str):
-    """Establece y valida la conexión. Lanza excepción si falla."""
-    conn = psycopg.connect(
+    """Establece la conexión (autocommit). Lanza psycopg.OperationalError si falla."""
+    return psycopg.connect(
         host=host, port=puerto, dbname=base_datos, user=usuario, password=contrasena,
-        autocommit=True
+        autocommit=True,
     )
-    return conn
+
 
 class CrudgenError(Exception):
     """Error esperado de la extensión, con formato CRUDGEN:<CODIGO>: <mensaje>."""
@@ -31,6 +29,7 @@ class CrudgenError(Exception):
         super().__init__(mensaje)
         self.codigo = codigo
         self.mensaje = mensaje
+
 
 def _ejecutar(conn, consulta, params: tuple = (), con_columnas: bool = False):
     """Ejecuta una consulta y devuelve sus filas (o [] si no produce resultado).
@@ -52,11 +51,12 @@ def _ejecutar(conn, consulta, params: tuple = (), con_columnas: bool = False):
             raise CrudgenError(codigo, texto.strip()) from e
         raise
 
+
 def cargar_config() -> dict:
     """Lee app/config.ini. Ver config.ejemplo.ini para el formato."""
     ruta = Path(__file__).parent / "config.ini"
     config = configparser.ConfigParser()
-    if not config.read(ruta):
+    if not config.read(ruta, encoding="utf-8"):
         raise FileNotFoundError(
             f"No existe {ruta}. Copia config.ejemplo.ini como config.ini y pon tus datos."
         )
@@ -70,9 +70,15 @@ def cargar_config() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Verificación de la extensión
+# ---------------------------------------------------------------------------
+
 def verificar_extension(conn) -> dict:
     """Determina el estado de crudgen en la base conectada.
-    estado: INSTALADA, NO_INSTALADA, SIN_ARCHIVOS, SIN_PERMISOS o ERROR."""
+    estado: INSTALADA, NO_INSTALADA, SIN_ARCHIVOS, SIN_PERMISOS o ERROR.
+    Siempre se consulta al SERVIDOR (pg_extension); nunca se asume que la
+    extensión existe por haber archivos en el equipo cliente."""
     try:
         # 1. ¿Está instalada en esta base?
         filas = _ejecutar(
@@ -93,7 +99,7 @@ def verificar_extension(conn) -> dict:
             return {
                 "estado": "SIN_ARCHIVOS",
                 "mensaje": "La extensión no está instalada ni sus archivos "
-                           "están en el servidor.",
+                           "están en el servidor (ejecute 'make install' en el servidor).",
             }
 
         version = filas[0][0]
@@ -104,7 +110,8 @@ def verificar_extension(conn) -> dict:
             return {
                 "estado": "SIN_PERMISOS",
                 "mensaje": "La extensión está instalada, pero el usuario "
-                           "conectado no tiene permisos para usarla.",
+                           "conectado no tiene permisos para usarla "
+                           "(falta GRANT USAGE ON SCHEMA crudgen).",
             }
         return {
             "estado": "INSTALADA",
@@ -115,34 +122,35 @@ def verificar_extension(conn) -> dict:
         return {
             "estado": "SIN_PERMISOS",
             "mensaje": "La extensión está instalada, pero el usuario "
-                       "conectado no tiene permisos para usarla.",
+                       "conectado no tiene permisos para usarla "
+                       "(falta GRANT USAGE ON SCHEMA crudgen).",
         }
     except psycopg.Error as e:
         return {"estado": "ERROR", "mensaje": f"Error al consultar la extensión: {e}"}
 
 
+# ---------------------------------------------------------------------------
+# Wrappers de la extensión (ver docs/CONTRATO.md)
+# ---------------------------------------------------------------------------
+
 def listar_esquemas(conn) -> list[str]:
-    """Ver CONTRATO.md sección 2."""
+    """CONTRATO sección 2."""
     filas = _ejecutar(conn, "SELECT nombre_esquema FROM crudgen.listar_esquemas();")
     return [r[0] for r in filas]
 
 
-# TODO: listar_tablas, analizar_tabla, generar_crud, asignar_privilegio,
-# revocar_privilegio -- wrappers análogos a los de arriba, siguiendo
-# CONTRATO.md. Responsable: C.
-
 def listar_tablas(conn, esquema: str) -> list[dict]:
-    """Ver CONTRATO.md sección 3."""
+    """CONTRATO sección 3."""
     filas = _ejecutar(
         conn,
         "SELECT nombre_tabla, tiene_pk FROM crudgen.listar_tablas(%s);",
         (esquema,),
     )
     return [{"nombre_tabla": r[0], "tiene_pk": r[1]} for r in filas]
-    
+
 
 def analizar_tabla(conn, esquema: str, tabla: str) -> list[dict]:
-    """Ver CONTRATO.md sección 4."""
+    """CONTRATO sección 4."""
     filas = _ejecutar(
         conn,
         """
@@ -165,8 +173,9 @@ def analizar_tabla(conn, esquema: str, tabla: str) -> list[dict]:
         for r in filas
     ]
 
+
 def generar_crud(conn, esquema: str, tabla: str, operaciones: list[str]) -> list[dict]:
-    """Ver CONTRATO.md sección 5."""
+    """CONTRATO sección 5."""
     filas = _ejecutar(
         conn,
         """
@@ -182,7 +191,7 @@ def generar_crud(conn, esquema: str, tabla: str, operaciones: list[str]) -> list
 
 
 def asignar_privilegio(conn, esquema: str, procedimiento: str, rol: str) -> bool:
-    """Ver CONTRATO.md sección 6."""
+    """CONTRATO sección 6."""
     filas = _ejecutar(
         conn,
         "SELECT crudgen.asignar_privilegio(%s, %s, %s);",
@@ -192,7 +201,7 @@ def asignar_privilegio(conn, esquema: str, procedimiento: str, rol: str) -> bool
 
 
 def revocar_privilegio(conn, esquema: str, procedimiento: str, rol: str) -> bool:
-    """Ver CONTRATO.md sección 7."""
+    """CONTRATO sección 7."""
     filas = _ejecutar(
         conn,
         "SELECT crudgen.revocar_privilegio(%s, %s, %s);",
@@ -200,41 +209,74 @@ def revocar_privilegio(conn, esquema: str, procedimiento: str, rol: str) -> bool
     )
     return filas[0][0]
 
-def obtener_parametros(conn, esquema: str, procedimiento: str) -> list[dict]:
-    """Parámetros de entrada de un procedimiento generado, en orden."""
+
+def listar_roles(conn) -> list[dict]:
+    """CONTRATO sección 8."""
+    filas = _ejecutar(
+        conn, "SELECT nombre_rol, puede_iniciar_sesion FROM crudgen.listar_roles();"
+    )
+    return [{"nombre_rol": r[0], "puede_iniciar_sesion": r[1]} for r in filas]
+
+
+def listar_procedimientos_generados(conn, esquema: str, tabla: str | None = None) -> list[dict]:
+    """CONTRATO sección 9. Sin tabla, lista los de todo el esquema."""
     filas = _ejecutar(
         conn,
         """
-        SELECT p.parameter_name, p.udt_name, p.parameter_default IS NOT NULL
-        FROM information_schema.parameters p
-        JOIN information_schema.routines r
-          ON r.specific_schema = p.specific_schema
-         AND r.specific_name   = p.specific_name
-        WHERE r.routine_schema = %s
-          AND r.routine_name   = %s
-          AND p.parameter_mode = 'IN'
-        ORDER BY p.ordinal_position;
+        SELECT nombre_procedimiento, tipo, definicion
+        FROM crudgen.listar_procedimientos_generados(%s, %s);
+        """,
+        (esquema, tabla),
+    )
+    return [
+        {"nombre_procedimiento": r[0], "tipo": r[1], "definicion": r[2]}
+        for r in filas
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Ejecución de los procedimientos generados
+# ---------------------------------------------------------------------------
+
+def obtener_parametros(conn, esquema: str, procedimiento: str) -> list[dict]:
+    """Parámetros de entrada de un procedimiento generado, en orden.
+    Se lee de pg_proc (no de information_schema, que oculta objetos según
+    los privilegios del usuario). 'opcional' = el parámetro tiene DEFAULT."""
+    filas = _ejecutar(
+        conn,
+        """
+        SELECT a.nombre,
+               pg_catalog.format_type(a.tipo, NULL),
+               a.pos > (p.pronargs - p.pronargdefaults)
+        FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace s ON s.oid = p.pronamespace
+        CROSS JOIN LATERAL unnest(p.proargnames, p.proargtypes::oid[])
+                   WITH ORDINALITY AS a(nombre, tipo, pos)
+        WHERE s.nspname = %s
+          AND p.proname = %s
+          AND p.prokind IN ('f', 'p')
+        ORDER BY a.pos;
         """,
         (esquema, procedimiento),
     )
-    return [
-        {"nombre": r[0], "tipo": r[1], "opcional": r[2]}
-        for r in filas
-    ]
+    return [{"nombre": r[0], "tipo": r[1], "opcional": r[2]} for r in filas]
+
 
 def es_funcion(conn, esquema: str, procedimiento: str) -> bool:
     """True si es FUNCTION (se llama con SELECT), False si es PROCEDURE (con CALL)."""
     filas = _ejecutar(
         conn,
         """
-        SELECT routine_type FROM information_schema.routines
-        WHERE routine_schema = %s AND routine_name = %s;
+        SELECT p.prokind
+        FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace s ON s.oid = p.pronamespace
+        WHERE s.nspname = %s AND p.proname = %s AND p.prokind IN ('f', 'p');
         """,
         (esquema, procedimiento),
     )
     if not filas:
         raise CrudgenError("PROC_NO_EXISTE", f"No existe {esquema}.{procedimiento}")
-    return filas[0][0] == "FUNCTION"
+    return filas[0][0] == "f"
 
 
 def ejecutar_procedimiento(conn, esquema: str, procedimiento: str,
@@ -262,26 +304,3 @@ def ejecutar_procedimiento(conn, esquema: str, procedimiento: str,
     finally:
         if como_rol:
             _ejecutar(conn, "RESET ROLE;")
-
-def listar_roles(conn) -> list[dict]:
-    """Ver CONTRATO.md sección 8."""
-    filas = _ejecutar(
-        conn, "SELECT nombre_rol, puede_iniciar_sesion FROM crudgen.listar_roles();"
-    )
-    return [{"nombre_rol": r[0], "puede_iniciar_sesion": r[1]} for r in filas]
-
-
-def listar_procedimientos_generados(conn, esquema: str, tabla: str | None = None) -> list[dict]:
-    """Ver CONTRATO.md sección 9. Sin tabla, lista los de todo el esquema."""
-    filas = _ejecutar(
-        conn,
-        """
-        SELECT nombre_procedimiento, tipo, definicion
-        FROM crudgen.listar_procedimientos_generados(%s, %s);
-        """,
-        (esquema, tabla),
-    )
-    return [
-        {"nombre_procedimiento": r[0], "tipo": r[1], "definicion": r[2]}
-        for r in filas
-    ]

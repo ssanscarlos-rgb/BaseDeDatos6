@@ -1,1 +1,13 @@
+# Credenciales locales
 app/config.ini
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store

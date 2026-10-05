@@ -1,5 +1,5 @@
 # crudgen extension
-comment = 'Generador automático de procedimientos CRUD a partir del catálogo de PostgreSQL'
+comment = 'Generador automatico de procedimientos CRUD a partir del catalogo de PostgreSQL'
 default_version = '1.0'
 relocatable = false
 schema = crudgen

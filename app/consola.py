@@ -1,6 +1,8 @@
 """Utilidades de terminal: mostrar opciones y leer respuestas.
 Este módulo no sabe nada de PostgreSQL."""
 
+from getpass import getpass
+
 
 def titulo(texto: str) -> None:
     """Encabezado visible para separar cada paso del flujo."""
@@ -55,6 +57,15 @@ def pedir_texto(mensaje: str, opcional: bool = False) -> str | None:
             return respuesta
         if opcional:
             return None
+        print("  Este valor es obligatorio.")
+
+
+def pedir_secreto(mensaje: str) -> str:
+    """Pide un valor sin mostrarlo en pantalla (contraseñas)."""
+    while True:
+        respuesta = getpass(f"{mensaje}: ")
+        if respuesta:
+            return respuesta
         print("  Este valor es obligatorio.")
 
 
