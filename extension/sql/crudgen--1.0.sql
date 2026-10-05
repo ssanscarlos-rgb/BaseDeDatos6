@@ -3,7 +3,9 @@
 -- ESTE archivo (nombre--version.sql) al hacer CREATE EXTENSION.
 -- NO crear archivos .sql sueltos adicionales en esta carpeta.
 --
--- Ver CONTRATO.md (v0.2) para la especificación de cada función.
+-- Ver docs/CONTRATO.md (v0.3) para la especificación de cada función.
+-- Requiere PostgreSQL 12 o superior (usa pg_attribute.attgenerated y
+-- PROCEDURE).
 --
 -- NOTA: no llevar CREATE SCHEMA aquí. El crudgen.control ya declara
 -- "schema = crudgen", así que PostgreSQL crea el esquema automáticamente
@@ -12,8 +14,7 @@
 -- "el esquema crudgen no es un miembro de la extensión «crudgen»".
 
 -- =========================================================
--- 1. verificar_extension()  -- CONTRATO.md sección 1
--- Responsable: Jeanca (A)
+-- 1. verificar_extension()  -- CONTRATO sección 1
 -- =========================================================
 CREATE OR REPLACE FUNCTION crudgen.verificar_extension()
 RETURNS TABLE(instalada BOOLEAN, disponible_para_usuario BOOLEAN, version TEXT)
@@ -39,8 +40,7 @@ END;
 $$;
 
 -- =========================================================
--- 2. listar_esquemas()  -- CONTRATO.md sección 2
--- Responsable: Jeanca (A)
+-- 2. listar_esquemas()  -- CONTRATO sección 2
 -- =========================================================
 CREATE OR REPLACE FUNCTION crudgen.listar_esquemas()
 RETURNS TABLE(nombre_esquema TEXT)
@@ -48,24 +48,24 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     RETURN QUERY
-    SELECT schema_name::TEXT
-    FROM information_schema.schemata
-    WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'crudgen')
-      AND schema_name NOT LIKE 'pg_toast%'
-      AND schema_name NOT LIKE 'pg_temp%';
+    SELECT s.schema_name::TEXT
+    FROM information_schema.schemata s
+    WHERE s.schema_name NOT IN ('pg_catalog', 'information_schema', 'crudgen')
+      AND s.schema_name NOT LIKE 'pg\_toast%'
+      AND s.schema_name NOT LIKE 'pg\_temp%'
+    ORDER BY s.schema_name;
 END;
 $$;
 
 -- =========================================================
--- 3. listar_tablas(p_esquema TEXT)  -- CONTRATO.md sección 3
--- Responsable: Jeanca (A)
+-- 3. listar_tablas(p_esquema TEXT)  -- CONTRATO sección 3
 -- =========================================================
 CREATE OR REPLACE FUNCTION crudgen.listar_tablas(p_esquema TEXT)
 RETURNS TABLE(nombre_tabla TEXT, tiene_pk BOOLEAN)
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = p_esquema) THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.schemata s WHERE s.schema_name = p_esquema) THEN
         RAISE EXCEPTION 'CRUDGEN:ESQUEMA_NO_EXISTE: el esquema % no existe', p_esquema;
     END IF;
 
@@ -81,13 +81,22 @@ BEGIN
         )
     FROM information_schema.tables t
     WHERE t.table_schema = p_esquema
-      AND t.table_type = 'BASE TABLE';
+      AND t.table_type = 'BASE TABLE'
+    ORDER BY t.table_name;
 END;
 $$;
 
 -- =========================================================
--- 4. analizar_tabla(p_esquema TEXT, p_tabla TEXT)  -- CONTRATO.md sección 4
--- Responsable: Jeanca (A)
+-- 4. analizar_tabla(p_esquema TEXT, p_tabla TEXT)  -- CONTRATO sección 4
+--
+-- Lee TODO directamente de pg_catalog (no de information_schema, que
+-- solo muestra lo que el usuario tiene permiso de ver y no resuelve bien
+-- tipos definidos por el usuario).
+--
+-- SET search_path = pg_catalog: así format_type() y pg_get_expr() devuelven
+-- los nombres de tipos y funciones calificados con su esquema cuando no son
+-- de pg_catalog (ej. public.mi_enum), lo que los hace utilizables dentro de
+-- los procedimientos generados, que también corren con search_path fijo.
 -- =========================================================
 CREATE OR REPLACE FUNCTION crudgen.analizar_tabla(p_esquema TEXT, p_tabla TEXT)
 RETURNS TABLE(
@@ -100,6 +109,7 @@ RETURNS TABLE(
     es_nullable     BOOLEAN
 )
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $$
 DECLARE
     v_reloid OID;
@@ -107,7 +117,9 @@ BEGIN
     SELECT c.oid INTO v_reloid
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = p_esquema AND c.relname = p_tabla;
+    WHERE n.nspname = p_esquema
+      AND c.relname = p_tabla
+      AND c.relkind IN ('r', 'p');          -- tabla ordinaria o particionada
 
     IF v_reloid IS NULL THEN
         RAISE EXCEPTION 'CRUDGEN:TABLA_NO_EXISTE: la tabla %.% no existe', p_esquema, p_tabla;
@@ -115,49 +127,115 @@ BEGIN
 
     RETURN QUERY
     SELECT
-        col.column_name::TEXT,
-        col.udt_name::TEXT AS tipo,
-        col.ordinal_position::INT AS orden,
-        COALESCE(pk.es_pk, false) AS es_pk,
+        a.attname::TEXT,
+        format_type(a.atttypid, NULL)::TEXT,
+        (row_number() OVER (ORDER BY a.attnum))::INT,
+        COALESCE(a.attnum = ANY (pk.indkey::INT2[]), false),
         (
-            COALESCE(col.column_default LIKE 'nextval(%', false)
-            OR col.is_identity = 'YES'
-            OR col.is_generated = 'ALWAYS'
-        ) AS es_autogenerada,
-        col.column_default::TEXT AS valor_default,
-        (col.is_nullable = 'YES') AS es_nullable
-    FROM information_schema.columns col
-    LEFT JOIN (
-        SELECT a.attname AS column_name, true AS es_pk
-        FROM pg_index i
-        JOIN pg_attribute a
-          ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-        WHERE i.indrelid = v_reloid AND i.indisprimary
-    ) pk ON pk.column_name = col.column_name
-    WHERE col.table_schema = p_esquema AND col.table_name = p_tabla
-    ORDER BY col.ordinal_position;
+            a.attidentity <> ''                       -- IDENTITY (ALWAYS / BY DEFAULT)
+            OR a.attgenerated <> ''                   -- GENERATED ALWAYS AS (...) STORED
+            OR COALESCE(pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%', false)  -- serial
+        ),
+        pg_get_expr(d.adbin, d.adrelid)::TEXT,
+        NOT a.attnotnull
+    FROM pg_attribute a
+    LEFT JOIN pg_attrdef d
+           ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+    LEFT JOIN pg_index pk
+           ON pk.indrelid = a.attrelid AND pk.indisprimary
+    WHERE a.attrelid = v_reloid
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+    ORDER BY a.attnum;
+END;
+$$;
+
+-- =========================================================
+-- Auxiliar interna: _crear_objeto
+-- Crea un procedimiento/función generado de forma segura:
+--   1. Elimina TODAS las sobrecargas existentes con ese nombre en el esquema
+--      (CREATE OR REPLACE con otra firma crearía una sobrecarga en lugar de
+--      reemplazar, dejando basura y haciendo ambiguos GRANT/REVOKE).
+--   2. Ejecuta el CREATE.
+--   3. Quita EXECUTE a PUBLIC (la matriz de privilegios manda).
+--   4. Marca el objeto con COMMENT 'crudgen:generado'.
+-- Devuelve true si ya existía algún objeto con ese nombre.
+-- Los nombres <tabla>_insertar/_consultar/_actualizar/_eliminar quedan
+-- reservados para el generador.
+-- =========================================================
+CREATE OR REPLACE FUNCTION crudgen._crear_objeto(
+    p_esquema TEXT,
+    p_nombre  TEXT,
+    p_tipo    TEXT,      -- 'PROCEDURE' o 'FUNCTION'
+    p_sql     TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_existente  RECORD;
+    v_ya_existia BOOLEAN := false;
+    v_oid        OID;
+BEGIN
+    FOR v_existente IN
+        SELECT p.oid::regprocedure AS firma, p.prokind
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = p_esquema
+          AND p.proname = p_nombre
+          AND p.prokind IN ('f', 'p')
+    LOOP
+        v_ya_existia := true;
+        EXECUTE format('DROP %s %s',
+                       CASE WHEN v_existente.prokind = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END,
+                       v_existente.firma);
+    END LOOP;
+
+    EXECUTE p_sql;
+
+    SELECT p.oid INTO v_oid
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = p_esquema AND p.proname = p_nombre;
+
+    EXECUTE format('REVOKE EXECUTE ON %s %s FROM PUBLIC', p_tipo, v_oid::regprocedure);
+    EXECUTE format('COMMENT ON %s %s IS %L', p_tipo, v_oid::regprocedure, 'crudgen:generado');
+
+    RETURN v_ya_existia;
 END;
 $$;
 
 -- =====================================================================
 -- 5. generar_crud(p_esquema TEXT, p_tabla TEXT, p_operaciones TEXT[])
---    CONTRATO.md sección 5
--- Responsable: Omaru (B)
+--    CONTRATO sección 5
 --
--- Decisiones de diseño aplicadas (ya en CONTRATO.md):
+-- Decisiones de diseño:
 --   - INSERT / UPDATE / DELETE -> PROCEDURE (se llaman con CALL)
 --   - SELECT                   -> FUNCTION  (se llama con SELECT * FROM ...)
---   - SECURITY DEFINER en todos, con search_path fijo (evita hijacking)
---   - Convención de nombres: <tabla>_insertar / _consultar / _actualizar / _eliminar
---   - SELECT generado: parámetros de PK opcionales (NULL = trae todo)
+--   - SECURITY DEFINER en todos, con search_path fijo (evita hijacking).
+--     Los procedimientos se ejecutan con los permisos de su PROPIETARIO
+--     (quien corrió generar_crud); los roles a los que se hace GRANT EXECUTE
+--     NO necesitan permisos sobre la tabla.
+--   - Nombres: <tabla>_insertar / _consultar / _actualizar / _eliminar
+--   - Los parámetros se llaman p_<columna> (entrecomillados con quote_ident,
+--     así soportan espacios, mayúsculas y palabras reservadas).
 --
--- FIX (Jeanca, tras probar con la tabla 'matriculas' -- PK compuesta por
--- TODAS sus columnas, sin ninguna columna no-PK): generar UPDATE sobre
--- una tabla así produce un "SET" vacío -> SQL inválido. Se agregó
--- validación explícita que lanza CRUDGEN:SIN_COLUMNAS_ACTUALIZABLES en
--- vez de dejar que Postgres tire un error nativo sin el formato acordado.
+-- INSERT:
+--   * columnas autogeneradas (serial/identity/generated) -> no son parámetro
+--   * columnas con DEFAULT   -> parámetro opcional: COALESCE(p, <default>)
+--   * columnas NULL sin DEFAULT -> parámetro opcional (NULL si se omite)
+--   * columnas NOT NULL sin DEFAULT -> parámetro obligatorio
+--   * si no queda ninguna columna a insertar -> INSERT ... DEFAULT VALUES
+-- UPDATE:
+--   * PK obligatoria (todas las columnas de la clave, simple o compuesta)
+--   * resto de columnas opcionales: NULL = "no modificar" (COALESCE).
+--     LIMITACIÓN CONOCIDA: con este procedimiento no se puede dejar una
+--     columna en NULL.
+-- SELECT:
+--   * parámetros de PK opcionales; los NULL no filtran (si no se pasa
+--     ninguno, devuelve toda la tabla; se puede filtrar por parte de una PK
+--     compuesta).
 -- =====================================================================
-
 CREATE OR REPLACE FUNCTION crudgen.generar_crud(
     p_esquema     TEXT,
     p_tabla       TEXT,
@@ -167,200 +245,191 @@ RETURNS TABLE(operacion TEXT, nombre_procedimiento TEXT, ya_existia BOOLEAN)
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_op                TEXT;
-    v_col               RECORD;
-    v_pk_cols           TEXT[] := ARRAY[]::TEXT[];
-    v_insert_cols       TEXT[] := ARRAY[]::TEXT[];
-    v_insert_params     TEXT[] := ARRAY[]::TEXT[];
-    v_insert_param_defs TEXT[] := ARRAY[]::TEXT[];
-    v_pk_param_defs     TEXT[] := ARRAY[]::TEXT[];   -- p_col tipo   (obligatorios, para UPDATE/DELETE)
-    v_pk_param_defs_opt TEXT[] := ARRAY[]::TEXT[];   -- p_col tipo DEFAULT NULL (para SELECT)
-    v_update_param_defs TEXT[] := ARRAY[]::TEXT[];
-    v_set_clauses       TEXT[] := ARRAY[]::TEXT[];
-    v_where_pk          TEXT;
-    v_pk_notnull_check  TEXT;
-    v_nombre_proc       TEXT;
-    v_sql               TEXT;
-    v_ya_existia        BOOLEAN;
+    v_op        TEXT;
+    v_ops       TEXT[];
+    v_col       RECORD;
+    v_c         TEXT;      -- columna entrecomillada
+    v_p         TEXT;      -- parámetro entrecomillado (p_<columna>)
+
+    v_pk_n          INT := 0;
+    v_pk_req        TEXT[] := ARRAY[]::TEXT[];   -- p_x tipo
+    v_pk_opt        TEXT[] := ARRAY[]::TEXT[];   -- p_x tipo DEFAULT NULL
+    v_pk_where      TEXT[] := ARRAY[]::TEXT[];   -- x = p_x
+    v_pk_filtro     TEXT[] := ARRAY[]::TEXT[];   -- (p_x IS NULL OR x = p_x)
+
+    v_ins_cols      TEXT[] := ARRAY[]::TEXT[];
+    v_ins_vals      TEXT[] := ARRAY[]::TEXT[];
+    v_ins_req       TEXT[] := ARRAY[]::TEXT[];
+    v_ins_opt       TEXT[] := ARRAY[]::TEXT[];
+
+    v_upd_params    TEXT[] := ARRAY[]::TEXT[];
+    v_upd_set       TEXT[] := ARRAY[]::TEXT[];
+
+    v_nombre    TEXT;
+    v_sql       TEXT;
+    v_existia   BOOLEAN;
 BEGIN
-    -- 1. Validar que las operaciones pedidas sean válidas
-    FOREACH v_op IN ARRAY p_operaciones LOOP
-        IF v_op NOT IN ('INSERT','SELECT','UPDATE','DELETE') THEN
+    -- 1. Validar operaciones
+    IF p_operaciones IS NULL OR array_length(p_operaciones, 1) IS NULL THEN
+        RAISE EXCEPTION 'CRUDGEN:OPERACION_INVALIDA: no se indicó ninguna operación';
+    END IF;
+
+    SELECT array_agg(DISTINCT upper(o)) INTO v_ops FROM unnest(p_operaciones) AS o;
+
+    FOREACH v_op IN ARRAY v_ops LOOP
+        IF v_op NOT IN ('INSERT', 'SELECT', 'UPDATE', 'DELETE') THEN
             RAISE EXCEPTION 'CRUDGEN:OPERACION_INVALIDA: % no es una operación soportada', v_op;
         END IF;
     END LOOP;
 
-    -- 2. Leer la estructura real de la tabla (función 4 del contrato, de Jeanca)
-    FOR v_col IN
-        SELECT * FROM crudgen.analizar_tabla(p_esquema, p_tabla) ORDER BY orden
+    -- Los nombres generados deben caber en 63 caracteres (si no, Postgres
+    -- los trunca en silencio y dejarían de coincidir).
+    IF length(p_tabla) + length('_actualizar') > 63 THEN
+        RAISE EXCEPTION 'CRUDGEN:NOMBRE_MUY_LARGO: el nombre de la tabla % es demasiado largo para generar procedimientos', p_tabla;
+    END IF;
+
+    -- 2. Leer la estructura real de la tabla (función 4 del contrato)
+    FOR v_col IN SELECT * FROM crudgen.analizar_tabla(p_esquema, p_tabla)
     LOOP
+        IF length('p_' || v_col.columna) > 63 THEN
+            RAISE EXCEPTION 'CRUDGEN:NOMBRE_MUY_LARGO: el nombre de la columna % es demasiado largo para generar su parámetro', v_col.columna;
+        END IF;
+
+        v_c := quote_ident(v_col.columna);
+        v_p := quote_ident('p_' || v_col.columna);
+
         IF v_col.es_pk THEN
-            v_pk_cols       := array_append(v_pk_cols, v_col.columna);
-            v_pk_param_defs := array_append(v_pk_param_defs, format('p_%s %s', v_col.columna, v_col.tipo));
-            v_pk_param_defs_opt := array_append(v_pk_param_defs_opt, format('p_%s %s DEFAULT NULL', v_col.columna, v_col.tipo));
+            v_pk_n      := v_pk_n + 1;
+            v_pk_req    := array_append(v_pk_req,    format('%s %s', v_p, v_col.tipo));
+            v_pk_opt    := array_append(v_pk_opt,    format('%s %s DEFAULT NULL', v_p, v_col.tipo));
+            v_pk_where  := array_append(v_pk_where,  format('%s = %s', v_c, v_p));
+            v_pk_filtro := array_append(v_pk_filtro, format('(%s IS NULL OR %s = %s)', v_p, v_c, v_p));
         END IF;
 
         IF NOT v_col.es_autogenerada THEN
-            v_insert_cols       := array_append(v_insert_cols, v_col.columna);
-            v_insert_params     := array_append(v_insert_params, format('p_%s', v_col.columna));
-            v_insert_param_defs := array_append(v_insert_param_defs, format('p_%s %s', v_col.columna, v_col.tipo));
+            v_ins_cols := array_append(v_ins_cols, v_c);
+            IF v_col.valor_default IS NOT NULL THEN
+                -- Tiene DEFAULT: parámetro opcional; si llega NULL se usa el default
+                v_ins_opt  := array_append(v_ins_opt,  format('%s %s DEFAULT NULL', v_p, v_col.tipo));
+                v_ins_vals := array_append(v_ins_vals, format('COALESCE(%s, %s)', v_p, v_col.valor_default));
+            ELSIF v_col.es_nullable THEN
+                v_ins_opt  := array_append(v_ins_opt,  format('%s %s DEFAULT NULL', v_p, v_col.tipo));
+                v_ins_vals := array_append(v_ins_vals, v_p);
+            ELSE
+                v_ins_req  := array_append(v_ins_req,  format('%s %s', v_p, v_col.tipo));
+                v_ins_vals := array_append(v_ins_vals, v_p);
+            END IF;
         END IF;
 
-        -- [FIX] antes solo se excluía por ser PK; una columna GENERATED
-        -- ALWAYS AS (...) STORED tampoco se puede tocar en UPDATE (Postgres
-        -- la rechaza igual que en INSERT), así que también se excluye aquí.
+        -- Columnas actualizables: ni PK ni autogeneradas (una columna
+        -- GENERATED tampoco puede tocarse en UPDATE).
         IF NOT v_col.es_pk AND NOT v_col.es_autogenerada THEN
-            v_update_param_defs := array_append(v_update_param_defs, format('p_%s %s DEFAULT NULL', v_col.columna, v_col.tipo));
-            v_set_clauses       := array_append(v_set_clauses, format('%I = COALESCE(p_%s, %I)', v_col.columna, v_col.columna, v_col.columna));
+            v_upd_params := array_append(v_upd_params, format('%s %s DEFAULT NULL', v_p, v_col.tipo));
+            v_upd_set    := array_append(v_upd_set,    format('%s = COALESCE(%s, %s)', v_c, v_p, v_c));
         END IF;
     END LOOP;
 
-    -- 3. Sin PK no se puede generar UPDATE/DELETE (caso límite del contrato)
-    IF array_length(v_pk_cols, 1) IS NULL
-       AND (p_operaciones && ARRAY['UPDATE','DELETE']) THEN
+    -- 3. Validaciones de casos límite
+    IF v_pk_n = 0 AND (v_ops && ARRAY['UPDATE', 'DELETE']) THEN
         RAISE EXCEPTION 'CRUDGEN:NO_PK: la tabla %.% no tiene clave primaria; no se puede generar UPDATE/DELETE', p_esquema, p_tabla;
     END IF;
 
-    -- 3b. [FIX] Sin columnas no-PK tampoco se puede generar UPDATE
-    -- (tabla donde TODA columna es parte de la PK, ej. una tabla de
-    -- relación N:M pura como 'matriculas')
-    IF array_length(v_set_clauses, 1) IS NULL
-       AND ('UPDATE' = ANY(p_operaciones)) THEN
+    IF 'UPDATE' = ANY (v_ops) AND array_length(v_upd_set, 1) IS NULL THEN
         RAISE EXCEPTION 'CRUDGEN:SIN_COLUMNAS_ACTUALIZABLES: la tabla %.% no tiene columnas fuera de la clave primaria; no se puede generar UPDATE', p_esquema, p_tabla;
     END IF;
 
-    IF array_length(v_pk_cols, 1) IS NOT NULL THEN
-        SELECT array_to_string(array_agg(format('%I = p_%s', c, c)), ' AND ')
-          INTO v_where_pk
-          FROM unnest(v_pk_cols) AS c;
-
-        SELECT array_to_string(array_agg(format('p_%s IS NOT NULL', c)), ' AND ')
-          INTO v_pk_notnull_check
-          FROM unnest(v_pk_cols) AS c;
-    END IF;
-
     -- 4. Generar cada operación pedida
-    FOREACH v_op IN ARRAY p_operaciones LOOP
+    FOREACH v_op IN ARRAY v_ops LOOP
         CASE v_op
 
         WHEN 'INSERT' THEN
-            v_nombre_proc := format('%s_insertar', p_tabla);
-            SELECT EXISTS (
-                SELECT 1 FROM pg_proc pr JOIN pg_namespace n ON n.oid = pr.pronamespace
-                WHERE n.nspname = p_esquema AND pr.proname = v_nombre_proc
-            ) INTO v_ya_existia;
-
-            v_sql := format(
-                'CREATE OR REPLACE PROCEDURE %I.%I(%s)
-                 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
-                 BEGIN
-                     INSERT INTO %I.%I (%s) VALUES (%s);
-                 END; $body$;',
-                p_esquema, v_nombre_proc,
-                array_to_string(v_insert_param_defs, ', '),
-                p_esquema, p_tabla,
-                (SELECT array_to_string(array_agg(quote_ident(c)), ', ') FROM unnest(v_insert_cols) AS c),
-                array_to_string(v_insert_params, ', ')
-            );
-            EXECUTE v_sql;
-            -- Por defecto Postgres da EXECUTE a PUBLIC; sin esto la matriz
-            -- de privilegios no significaría nada (cualquiera podría llamarlo).
-            EXECUTE format('REVOKE EXECUTE ON PROCEDURE %I.%I FROM PUBLIC', p_esquema, v_nombre_proc);
-
-            operacion := 'INSERT'; nombre_procedimiento := v_nombre_proc; ya_existia := v_ya_existia;
+            v_nombre := p_tabla || '_insertar';
+            IF array_length(v_ins_cols, 1) IS NULL THEN
+                v_sql := format(
+                    'CREATE PROCEDURE %I.%I()
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
+BEGIN
+    INSERT INTO %I.%I DEFAULT VALUES;
+END; $body$;',
+                    p_esquema, v_nombre, p_esquema, p_tabla);
+            ELSE
+                v_sql := format(
+                    'CREATE PROCEDURE %I.%I(%s)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
+BEGIN
+    INSERT INTO %I.%I (%s) VALUES (%s);
+END; $body$;',
+                    p_esquema, v_nombre,
+                    array_to_string(v_ins_req || v_ins_opt, ', '),   -- obligatorios primero
+                    p_esquema, p_tabla,
+                    array_to_string(v_ins_cols, ', '),
+                    array_to_string(v_ins_vals, ', '));
+            END IF;
+            v_existia := crudgen._crear_objeto(p_esquema, v_nombre, 'PROCEDURE', v_sql);
+            operacion := 'INSERT'; nombre_procedimiento := v_nombre; ya_existia := v_existia;
             RETURN NEXT;
 
         WHEN 'UPDATE' THEN
-            v_nombre_proc := format('%s_actualizar', p_tabla);
-            SELECT EXISTS (
-                SELECT 1 FROM pg_proc pr JOIN pg_namespace n ON n.oid = pr.pronamespace
-                WHERE n.nspname = p_esquema AND pr.proname = v_nombre_proc
-            ) INTO v_ya_existia;
-
+            v_nombre := p_tabla || '_actualizar';
             v_sql := format(
-                'CREATE OR REPLACE PROCEDURE %I.%I(%s, %s)
-                 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
-                 BEGIN
-                     UPDATE %I.%I SET %s WHERE %s;
-                 END; $body$;',
-                p_esquema, v_nombre_proc,
-                array_to_string(v_pk_param_defs, ', '),
-                array_to_string(v_update_param_defs, ', '),
+                'CREATE PROCEDURE %I.%I(%s, %s)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
+BEGIN
+    UPDATE %I.%I SET %s WHERE %s;
+END; $body$;',
+                p_esquema, v_nombre,
+                array_to_string(v_pk_req, ', '),
+                array_to_string(v_upd_params, ', '),
                 p_esquema, p_tabla,
-                array_to_string(v_set_clauses, ', '),
-                v_where_pk
-            );
-            EXECUTE v_sql;
-            EXECUTE format('REVOKE EXECUTE ON PROCEDURE %I.%I FROM PUBLIC', p_esquema, v_nombre_proc);
-
-            operacion := 'UPDATE'; nombre_procedimiento := v_nombre_proc; ya_existia := v_ya_existia;
+                array_to_string(v_upd_set, ', '),
+                array_to_string(v_pk_where, ' AND '));
+            v_existia := crudgen._crear_objeto(p_esquema, v_nombre, 'PROCEDURE', v_sql);
+            operacion := 'UPDATE'; nombre_procedimiento := v_nombre; ya_existia := v_existia;
             RETURN NEXT;
 
         WHEN 'DELETE' THEN
-            v_nombre_proc := format('%s_eliminar', p_tabla);
-            SELECT EXISTS (
-                SELECT 1 FROM pg_proc pr JOIN pg_namespace n ON n.oid = pr.pronamespace
-                WHERE n.nspname = p_esquema AND pr.proname = v_nombre_proc
-            ) INTO v_ya_existia;
-
+            v_nombre := p_tabla || '_eliminar';
             v_sql := format(
-                'CREATE OR REPLACE PROCEDURE %I.%I(%s)
-                 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
-                 BEGIN
-                     DELETE FROM %I.%I WHERE %s;
-                 END; $body$;',
-                p_esquema, v_nombre_proc,
-                array_to_string(v_pk_param_defs, ', '),
+                'CREATE PROCEDURE %I.%I(%s)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
+BEGIN
+    DELETE FROM %I.%I WHERE %s;
+END; $body$;',
+                p_esquema, v_nombre,
+                array_to_string(v_pk_req, ', '),
                 p_esquema, p_tabla,
-                v_where_pk
-            );
-            EXECUTE v_sql;
-            EXECUTE format('REVOKE EXECUTE ON PROCEDURE %I.%I FROM PUBLIC', p_esquema, v_nombre_proc);
-
-            operacion := 'DELETE'; nombre_procedimiento := v_nombre_proc; ya_existia := v_ya_existia;
+                array_to_string(v_pk_where, ' AND '));
+            v_existia := crudgen._crear_objeto(p_esquema, v_nombre, 'PROCEDURE', v_sql);
+            operacion := 'DELETE'; nombre_procedimiento := v_nombre; ya_existia := v_existia;
             RETURN NEXT;
 
         WHEN 'SELECT' THEN
-            v_nombre_proc := format('%s_consultar', p_tabla);
-            SELECT EXISTS (
-                SELECT 1 FROM pg_proc pr JOIN pg_namespace n ON n.oid = pr.pronamespace
-                WHERE n.nspname = p_esquema AND pr.proname = v_nombre_proc
-            ) INTO v_ya_existia;
-
-            IF array_length(v_pk_cols, 1) IS NOT NULL THEN
+            v_nombre := p_tabla || '_consultar';
+            IF v_pk_n > 0 THEN
                 v_sql := format(
-                    'CREATE OR REPLACE FUNCTION %I.%I(%s)
-                     RETURNS SETOF %I.%I
-                     LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
-                     BEGIN
-                         IF %s THEN
-                             RETURN QUERY SELECT * FROM %I.%I WHERE %s;
-                         ELSE
-                             RETURN QUERY SELECT * FROM %I.%I;
-                         END IF;
-                     END; $body$;',
-                    p_esquema, v_nombre_proc,
-                    array_to_string(v_pk_param_defs_opt, ', '),
+                    'CREATE FUNCTION %I.%I(%s)
+RETURNS SETOF %I.%I
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
+BEGIN
+    RETURN QUERY SELECT * FROM %I.%I WHERE %s;
+END; $body$;',
+                    p_esquema, v_nombre,
+                    array_to_string(v_pk_opt, ', '),
                     p_esquema, p_tabla,
-                    v_pk_notnull_check,
-                    p_esquema, p_tabla, v_where_pk,
-                    p_esquema, p_tabla
-                );
+                    p_esquema, p_tabla,
+                    array_to_string(v_pk_filtro, ' AND '));
             ELSE
                 v_sql := format(
-                    'CREATE OR REPLACE FUNCTION %I.%I()
-                     RETURNS SETOF %I.%I
-                     LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
-                     BEGIN
-                         RETURN QUERY SELECT * FROM %I.%I;
-                     END; $body$;',
-                    p_esquema, v_nombre_proc, p_esquema, p_tabla, p_esquema, p_tabla
-                );
+                    'CREATE FUNCTION %I.%I()
+RETURNS SETOF %I.%I
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $body$
+BEGIN
+    RETURN QUERY SELECT * FROM %I.%I;
+END; $body$;',
+                    p_esquema, v_nombre, p_esquema, p_tabla, p_esquema, p_tabla);
             END IF;
-            EXECUTE v_sql;
-            EXECUTE format('REVOKE EXECUTE ON FUNCTION %I.%I FROM PUBLIC', p_esquema, v_nombre_proc);
-
-            operacion := 'SELECT'; nombre_procedimiento := v_nombre_proc; ya_existia := v_ya_existia;
+            v_existia := crudgen._crear_objeto(p_esquema, v_nombre, 'FUNCTION', v_sql);
+            operacion := 'SELECT'; nombre_procedimiento := v_nombre; ya_existia := v_existia;
             RETURN NEXT;
 
         END CASE;
@@ -368,14 +437,11 @@ BEGIN
 END;
 $$;
 
-
 -- =====================================================================
--- 6/7. asignar_privilegio / revocar_privilegio
--- Responsable: Omaru (B)
--- Funcionan tanto para PROCEDURE (INSERT/UPDATE/DELETE) como para
--- FUNCTION (SELECT) porque resuelven el tipo real desde pg_proc.
+-- 6/7. asignar_privilegio / revocar_privilegio  -- CONTRATO secciones 6 y 7
+-- Funcionan para PROCEDURE (INSERT/UPDATE/DELETE) y FUNCTION (SELECT).
+-- Se aplican a TODAS las sobrecargas del nombre (normalmente hay una).
 -- =====================================================================
-
 CREATE OR REPLACE FUNCTION crudgen.asignar_privilegio(
     p_esquema              TEXT,
     p_nombre_procedimiento TEXT,
@@ -385,37 +451,37 @@ RETURNS BOOLEAN
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_oid         OID;
-    v_kind        CHAR;
-    v_objeto_sql  TEXT;
+    v_obj   RECORD;
+    v_n     INT := 0;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = p_rol) THEN
         RAISE EXCEPTION 'CRUDGEN:ROL_NO_EXISTE: el rol % no existe', p_rol;
     END IF;
 
-    SELECT p.oid, p.prokind INTO v_oid, v_kind
-    FROM pg_proc p
-    JOIN pg_namespace n ON n.oid = p.pronamespace
-    WHERE n.nspname = p_esquema AND p.proname = p_nombre_procedimiento
-    LIMIT 1;
+    FOR v_obj IN
+        SELECT p.oid::regprocedure AS firma, p.prokind
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = p_esquema
+          AND p.proname = p_nombre_procedimiento
+          AND p.prokind IN ('f', 'p')
+    LOOP
+        IF v_n = 0 THEN
+            -- EXECUTE sobre el procedimiento no sirve sin USAGE sobre su esquema.
+            EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', p_esquema, p_rol);
+        END IF;
+        EXECUTE format('GRANT EXECUTE ON %s %s TO %I',
+                       CASE WHEN v_obj.prokind = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END,
+                       v_obj.firma, p_rol);
+        v_n := v_n + 1;
+    END LOOP;
 
-    IF v_oid IS NULL THEN
+    IF v_n = 0 THEN
         RAISE EXCEPTION 'CRUDGEN:PROC_NO_EXISTE: %.% no existe', p_esquema, p_nombre_procedimiento;
     END IF;
-
-    v_objeto_sql := format('%s %s',
-        CASE WHEN v_kind = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END,
-        v_oid::regprocedure
-    );
-
-    -- EXECUTE sobre el procedimiento no sirve de nada sin USAGE sobre el
-    -- esquema que lo contiene: sin esto el rol no puede ni referenciarlo.
-    EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', p_esquema, p_rol);
-    EXECUTE format('GRANT EXECUTE ON %s TO %I', v_objeto_sql, p_rol);
     RETURN TRUE;
 END;
 $$;
-
 
 CREATE OR REPLACE FUNCTION crudgen.revocar_privilegio(
     p_esquema              TEXT,
@@ -426,38 +492,36 @@ RETURNS BOOLEAN
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_oid         OID;
-    v_kind        CHAR;
-    v_objeto_sql  TEXT;
+    v_obj   RECORD;
+    v_n     INT := 0;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = p_rol) THEN
         RAISE EXCEPTION 'CRUDGEN:ROL_NO_EXISTE: el rol % no existe', p_rol;
     END IF;
 
-    SELECT p.oid, p.prokind INTO v_oid, v_kind
-    FROM pg_proc p
-    JOIN pg_namespace n ON n.oid = p.pronamespace
-    WHERE n.nspname = p_esquema AND p.proname = p_nombre_procedimiento
-    LIMIT 1;
+    FOR v_obj IN
+        SELECT p.oid::regprocedure AS firma, p.prokind
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = p_esquema
+          AND p.proname = p_nombre_procedimiento
+          AND p.prokind IN ('f', 'p')
+    LOOP
+        EXECUTE format('REVOKE EXECUTE ON %s %s FROM %I',
+                       CASE WHEN v_obj.prokind = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END,
+                       v_obj.firma, p_rol);
+        v_n := v_n + 1;
+    END LOOP;
 
-    IF v_oid IS NULL THEN
+    IF v_n = 0 THEN
         RAISE EXCEPTION 'CRUDGEN:PROC_NO_EXISTE: %.% no existe', p_esquema, p_nombre_procedimiento;
     END IF;
-
-    v_objeto_sql := format('%s %s',
-        CASE WHEN v_kind = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END,
-        v_oid::regprocedure
-    );
-
-    EXECUTE format('REVOKE EXECUTE ON %s FROM %I', v_objeto_sql, p_rol);
     RETURN TRUE;
 END;
 $$;
 
-
 -- =====================================================================
--- 8. listar_roles()  -- CONTRATO.md sección 8 (nueva)
--- Responsable: Jeanca (A)
+-- 8. listar_roles()  -- CONTRATO sección 8
 -- Necesaria para el paso "seleccionar usuarios o roles" del flujo.
 -- =====================================================================
 CREATE OR REPLACE FUNCTION crudgen.listar_roles()
@@ -473,21 +537,19 @@ BEGIN
 END;
 $$;
 
-
 -- =====================================================================
 -- 9. listar_procedimientos_generados(p_esquema TEXT, p_tabla TEXT DEFAULT NULL)
---    CONTRATO.md sección 9 (nueva)
--- Responsable: Jeanca (A)
--- Muestra qué procedimientos/funciones ya se generaron en un esquema,
--- opcionalmente filtrado por tabla (según convención de nombres
--- <tabla>_insertar/_consultar/_actualizar/_eliminar), con su código SQL.
+--    CONTRATO sección 9
+-- Con p_tabla: los 4 procedimientos de esa tabla (comparación exacta de
+-- nombre, sin comodines LIKE). Sin p_tabla: todos los marcados con
+-- COMMENT 'crudgen:generado' en el esquema.
 -- =====================================================================
 CREATE OR REPLACE FUNCTION crudgen.listar_procedimientos_generados(p_esquema TEXT, p_tabla TEXT DEFAULT NULL)
 RETURNS TABLE(nombre_procedimiento TEXT, tipo TEXT, definicion TEXT)
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = p_esquema) THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.schemata s WHERE s.schema_name = p_esquema) THEN
         RAISE EXCEPTION 'CRUDGEN:ESQUEMA_NO_EXISTE: el esquema % no existe', p_esquema;
     END IF;
 
@@ -499,12 +561,11 @@ BEGIN
     FROM pg_proc p
     JOIN pg_namespace n ON n.oid = p.pronamespace
     WHERE n.nspname = p_esquema
+      AND p.prokind IN ('f', 'p')
       AND (
-          p_tabla IS NULL
-          OR p.proname LIKE p_tabla || '\_insertar'
-          OR p.proname LIKE p_tabla || '\_consultar'
-          OR p.proname LIKE p_tabla || '\_actualizar'
-          OR p.proname LIKE p_tabla || '\_eliminar'
+          (p_tabla IS NULL AND obj_description(p.oid, 'pg_proc') = 'crudgen:generado')
+          OR p.proname IN (p_tabla || '_insertar', p_tabla || '_consultar',
+                           p_tabla || '_actualizar', p_tabla || '_eliminar')
       )
     ORDER BY p.proname;
 END;
