@@ -11,9 +11,9 @@ Solución en dos partes:
 
 | Nombre | Módulo |
 |---|---|
-| _(completar)_ | Extensión: análisis de catálogo y funciones de listado |
-| _(completar)_ | Extensión: generación CRUD y privilegios |
-| _(completar)_ | Aplicación Python |
+| Jean Carlos Huertas Piedra | Extensión: análisis de catálogo y funciones de listado |
+| Omar Chacon Porras | Extensión: generación CRUD y privilegios |
+| Andres Valerio Salas | Aplicación Python |
 
 ## Estructura del repositorio
 
