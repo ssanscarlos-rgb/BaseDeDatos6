@@ -270,7 +270,9 @@ def paso_privilegios(conn, generados: list[dict]) -> dict:
     for rol in elegidos:
         print(f"\n  ¿Qué operaciones puede ejecutar '{rol}'?")
         permitidas = consola.elegir_varios(disponibles + [NINGUNA], "Operaciones")
-        matriz[rol] = [] if NINGUNA in permitidas else permitidas
+        # "*" marca todas las opciones, incluida "(ninguna)": esa solo cuenta
+        # cuando es la única elegida; si hay otras operaciones, se descarta.
+        matriz[rol] = [] if permitidas == [NINGUNA] else [p for p in permitidas if p != NINGUNA]
 
     print("\n  Matriz de privilegios:")
     consola.mostrar_tabla(
